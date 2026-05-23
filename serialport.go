@@ -14,24 +14,12 @@ type config struct {
 	baud int
 }
 
-// WithBaud overrides the default baud rate (115200) used to open the serial
-// port. The TX510's wire-supported rates are 9600, 19200, 38400, 57600, and
-// 115200.
+// WithBaud overrides the default 115200 baud used to open the port.
 func WithBaud(baud int) Option {
 	return func(c *config) { c.baud = baud }
 }
 
-// New opens portName as an 8N1 serial port and returns a Client ready to talk
-// to a TX510 module. By default the port is opened at 115200 baud (the
-// factory default); pass WithBaud to override.
-//
-// Close the Client when done:
-//
-//	client, err := tx510.New("/dev/ttyUSB0")
-//	if err != nil {
-//	    return err
-//	}
-//	defer client.Close()
+// New opens portName as an 8N1 serial port (default 115200) and returns a Client.
 func New(portName string, opts ...Option) (*Client, error) {
 	cfg := &config{baud: 115200}
 	for _, o := range opts {
@@ -50,9 +38,6 @@ func New(portName string, opts ...Option) (*Client, error) {
 	return &Client{t: t, closer: t}, nil
 }
 
-// serialTransport adapts go.bug.st/serial.Port to Transport. It translates
-// the absolute SetReadDeadline used by Client into the relative SetReadTimeout
-// that the underlying library exposes.
 type serialTransport struct {
 	port serial.Port
 }
@@ -60,10 +45,7 @@ type serialTransport struct {
 func (s *serialTransport) Read(p []byte) (int, error)  { return s.port.Read(p) }
 func (s *serialTransport) Write(p []byte) (int, error) { return s.port.Write(p) }
 
-// SetReadDeadline translates an absolute deadline into the relative timeout
-// the underlying serial library uses. A zero time disables the timeout; a
-// deadline already in the past sets the timeout to zero so the next Read
-// returns immediately (this is how Client implements context cancellation).
+// SetReadDeadline translates an absolute deadline into the relative timeout the underlying serial library uses.
 func (s *serialTransport) SetReadDeadline(t time.Time) error {
 	if t.IsZero() {
 		return s.port.SetReadTimeout(serial.NoTimeout)
@@ -75,12 +57,11 @@ func (s *serialTransport) SetReadDeadline(t time.Time) error {
 	return s.port.SetReadTimeout(d)
 }
 
-// Close releases the underlying serial port.
 func (s *serialTransport) Close() error { return s.port.Close() }
 
-// Reconfigure changes the host-side baud rate (8N1) without reopening the
-// port. Client.SetBaudRate calls this automatically after a successful
-// device-side baud change.
+func (s *serialTransport) Flush() error { return s.port.ResetInputBuffer() }
+
+// Reconfigure changes the host-side baud rate (8N1) without reopening the port.
 func (s *serialTransport) Reconfigure(baud int) error {
 	return s.port.SetMode(&serial.Mode{
 		BaudRate: baud,

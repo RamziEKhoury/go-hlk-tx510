@@ -14,10 +14,9 @@ const DefaultTimeout = 5 * time.Second
 
 type Client struct {
 	t      Transport
-	closer io.Closer // nil when the caller supplied their own Transport
+	closer io.Closer
 	mu     sync.Mutex
 }
-
 
 func NewWithTransport(t Transport) *Client {
 	return &Client{t: t}
@@ -30,12 +29,11 @@ func (c *Client) Close() error {
 	return c.closer.Close()
 }
 
-
 type reconfigurer interface {
 	Reconfigure(baud int) error
 }
 
-func (c *Client) do(ctx context.Context, cmd CmdID, data []byte)(*Reply, error){
+func (c *Client) do(ctx context.Context, cmd CmdID, data []byte) (*Reply, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(DefaultTimeout)
@@ -53,6 +51,11 @@ func (c *Client) do(ctx context.Context, cmd CmdID, data []byte)(*Reply, error){
 		}
 	}()
 
+	// Drop stale RX bytes (boot noise, leftover from a timed-out call) before writing.
+	if f, ok := c.t.(Flusher); ok {
+		_ = f.Flush()
+	}
+
 	frame := BuildFrame(cmd, data)
 	if _, err := c.t.Write(frame); err != nil {
 		return nil, fmt.Errorf("tx510: write %s: %w", cmd, err)
@@ -68,29 +71,70 @@ func (c *Client) do(ctx context.Context, cmd CmdID, data []byte)(*Reply, error){
 	return reply, nil
 }
 
-func (c *Client) Recognize(ctx context.Context) (uint16, error) {
-	return c.recognizeOrRegister(ctx, CmdRecognize)
+// RecognizeOption tunes a single Recognize/Register call.
+type RecognizeOption func(*recognizeConfig)
+
+type recognizeConfig struct {
+	livenessRetries int
+	livenessDelay   time.Duration
 }
 
-func (c *Client) Register(ctx context.Context) (uint16, error) {
-	return c.recognizeOrRegister(ctx, CmdRegister)
+// AllowLivenessRetries retries Recognize/Register on liveness rejects up to n extra times, pausing delay between attempts. Other result codes are not retried.
+func AllowLivenessRetries(n int, delay time.Duration) RecognizeOption {
+	return func(c *recognizeConfig) {
+		if n < 0 {
+			n = 0
+		}
+		c.livenessRetries = n
+		c.livenessDelay = delay
+	}
 }
 
-func (c *Client) recognizeOrRegister(ctx context.Context, cmd CmdID) (uint16, error) {
+func (c *Client) Recognize(ctx context.Context, opts ...RecognizeOption) (uint16, error) {
+	return c.recognizeOrRegister(ctx, CmdRecognize, opts)
+}
+
+func (c *Client) Register(ctx context.Context, opts ...RecognizeOption) (uint16, error) {
+	return c.recognizeOrRegister(ctx, CmdRegister, opts)
+}
+
+func (c *Client) recognizeOrRegister(ctx context.Context, cmd CmdID, opts []RecognizeOption) (uint16, error) {
+	var cfg recognizeConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	reply, err := c.do(ctx, cmd, nil)
-	if err != nil {
-		return 0, err
+	attempts := 1 + cfg.livenessRetries
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 && cfg.livenessDelay > 0 {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(cfg.livenessDelay):
+			}
+		}
+
+		reply, err := c.do(ctx, cmd, nil)
+		if err != nil {
+			return 0, err
+		}
+		if rerr := reply.Err(); rerr != nil {
+			if IsLivenessError(rerr) && i < attempts-1 {
+				lastErr = rerr
+				continue
+			}
+			return 0, rerr
+		}
+		if len(reply.Payload) < 2 {
+			return 0, fmt.Errorf("tx510: %s reply payload too short: %d bytes", cmd, len(reply.Payload))
+		}
+		return binary.BigEndian.Uint16(reply.Payload[:2]), nil
 	}
-	if err := reply.Err(); err != nil {
-		return 0, err
-	}
-	if len(reply.Payload) < 2 {
-		return 0, fmt.Errorf("tx510: %s reply payload too short: %d bytes", cmd, len(reply.Payload))
-	}
-	return binary.BigEndian.Uint16(reply.Payload[:2]), nil
+	return 0, lastErr
 }
 
 func (c *Client) DeleteUser(ctx context.Context, faceID uint16) error {
@@ -128,7 +172,6 @@ func (c *Client) UserCount(ctx context.Context) ([]uint16, error) {
 	if err := reply.Err(); err != nil {
 		return nil, err
 	}
-	// Payload: count(2 BE) faceID_1(2 BE) ... faceID_N(2 BE)
 	if len(reply.Payload) < 2 {
 		return nil, nil
 	}
@@ -216,11 +259,9 @@ func (c *Client) SetBaudRate(ctx context.Context, rate BaudRate) error {
 	return nil
 }
 
-
 const TemplateSize = 1024
 const readTemplateOneShotSeq = 0x0F
 const templateRand = 0x42
-
 
 func (c *Client) ReadTemplate(ctx context.Context, faceID uint16) ([]byte, error) {
 	c.mu.Lock()
@@ -247,7 +288,6 @@ func (c *Client) ReadTemplate(ctx context.Context, faceID uint16) ([]byte, error
 	return out, nil
 }
 
-
 func (c *Client) WriteTemplate(ctx context.Context, template []byte) error {
 	if len(template) != TemplateSize {
 		return fmt.Errorf("tx510: WriteTemplate: template is %d bytes, want %d",
@@ -264,7 +304,6 @@ func (c *Client) WriteTemplate(ctx context.Context, template []byte) error {
 	)
 
 	for i := 0; i < 4; i++ {
-		// Request layout per manual §5.13: rand(1) seq(1) feature(256)
 		data := make([]byte, 0, 2+chunkSize)
 		data = append(data, templateRand, sendSeqs[i])
 		data = append(data, template[i*chunkSize:(i+1)*chunkSize]...)
@@ -277,7 +316,6 @@ func (c *Client) WriteTemplate(ctx context.Context, template []byte) error {
 			return fmt.Errorf("tx510: WriteTemplate chunk %d/4: %w", i+1, err)
 		}
 
-		// Reply payload per manual §5.13: rand(1) seq(1) faceID(2 BE)
 		if len(reply.Payload) < 2 {
 			return fmt.Errorf("tx510: WriteTemplate chunk %d/4: ack payload too short", i+1)
 		}

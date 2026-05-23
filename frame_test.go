@@ -59,8 +59,8 @@ func TestParseFrame_HappyPath(t *testing.T) {
 
 func TestParseFrame_TooShort(t *testing.T) {
 	cases := map[string][]byte{
-		"empty":         nil,
-		"only magic":    {0xEF, 0xAA},
+		"empty":          nil,
+		"only magic":     {0xEF, 0xAA},
 		"missing parity": {0xEF, 0xAA, 0x12, 0x00, 0x00, 0x00, 0x00}, // header but no parity byte
 	}
 	for name, raw := range cases {
@@ -135,6 +135,33 @@ func TestReadFrame_ShortHeader(t *testing.T) {
 	_, err := ReadFrame(bytes.NewReader([]byte{0xEF}))
 	if err == nil || !strings.Contains(err.Error(), "read header") {
 		t.Fatalf("got %v, want a read-header error", err)
+	}
+}
+
+func TestReadFrame_ResyncsPastLeadingJunk(t *testing.T) {
+	// Leading junk (incl. stray 0xEF not followed by 0xAA) must be skipped before the real frame.
+	data := []byte{byte(CmdVersion), byte(ResultSuccess), 'v', '1', '.', '0'}
+	good := BuildFrame(CmdVersion, data)
+	junk := []byte{0x00, 0xFF, 0xEF, 0x10, 0xAB, 0xEF, 0xEF}
+	stream := append(junk, good...)
+
+	reply, err := ReadFrame(bytes.NewReader(stream))
+	if err != nil {
+		t.Fatalf("ReadFrame after junk: %v", err)
+	}
+	if reply.AckedID != CmdVersion {
+		t.Errorf("AckedID = 0x%02X, want 0x%02X", byte(reply.AckedID), byte(CmdVersion))
+	}
+	if string(reply.Payload) != "v1.0" {
+		t.Errorf("Payload = %q, want %q", reply.Payload, "v1.0")
+	}
+}
+
+func TestReadFrame_ResyncBudgetExceeded(t *testing.T) {
+	noise := bytes.Repeat([]byte{0x00}, MaxFrameSize+10)
+	_, err := ReadFrame(bytes.NewReader(noise))
+	if !errors.Is(err, ErrBadHeader) {
+		t.Fatalf("got %v, want ErrBadHeader after exhausting resync budget", err)
 	}
 }
 

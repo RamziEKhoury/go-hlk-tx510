@@ -147,6 +147,76 @@ func TestClient_Recognize_DeviceError(t *testing.T) {
 	}
 }
 
+func TestClient_Recognize_RetriesOnLiveness2DFailed(t *testing.T) {
+	// Two 2D-liveness rejects then success: the retry path returns the third reply's faceID.
+	rt := newReplyTransport(
+		makeReply(CmdRecognize, ResultLiveness2DFailed, nil),
+		makeReply(CmdRecognize, ResultLiveness2DFailed, nil),
+		makeReply(CmdRecognize, ResultSuccess, []byte{0x00, 0x2A}),
+	)
+	c := NewWithTransport(rt)
+
+	faceID, err := c.Recognize(context.Background(), AllowLivenessRetries(2, 0))
+	if err != nil {
+		t.Fatalf("Recognize with retries: %v", err)
+	}
+	if faceID != 42 {
+		t.Errorf("faceID = %d, want 42", faceID)
+	}
+}
+
+func TestClient_Recognize_RetriesExhaustedReturnsLastLivenessError(t *testing.T) {
+	rt := newReplyTransport(
+		makeReply(CmdRecognize, ResultLiveness2DFailed, nil),
+		makeReply(CmdRecognize, ResultLiveness2DFailed, nil),
+		makeReply(CmdRecognize, ResultLiveness2DFailed, nil),
+	)
+	c := NewWithTransport(rt)
+
+	_, err := c.Recognize(context.Background(), AllowLivenessRetries(2, 0))
+	if err == nil {
+		t.Fatalf("want liveness error after retries exhausted, got nil")
+	}
+	if !IsLivenessError(err) {
+		t.Fatalf("got %v, want IsLivenessError=true", err)
+	}
+}
+
+func TestClient_Recognize_NonLivenessErrorNotRetried(t *testing.T) {
+	// Match-failed must not trigger the retry path even with AllowLivenessRetries set.
+	rt := newReplyTransport(
+		makeReply(CmdRecognize, ResultMatchFailed, []byte{0x00, 0x00}),
+		makeReply(CmdRecognize, ResultSuccess, []byte{0x00, 0x2A}),
+	)
+	c := NewWithTransport(rt)
+
+	_, err := c.Recognize(context.Background(), AllowLivenessRetries(3, 0))
+	if err == nil {
+		t.Fatalf("want match-failed error, got nil")
+	}
+	if IsLivenessError(err) {
+		t.Fatalf("got %v, did not want a liveness error", err)
+	}
+}
+
+func TestIsLivenessError(t *testing.T) {
+	if !IsLivenessError(&ResultError{Code: ResultLiveness2DFailed}) {
+		t.Errorf("ResultLiveness2DFailed should be a liveness error")
+	}
+	if !IsLivenessError(&ResultError{Code: ResultLiveness3DFailed}) {
+		t.Errorf("ResultLiveness3DFailed should be a liveness error")
+	}
+	if IsLivenessError(&ResultError{Code: ResultMatchFailed}) {
+		t.Errorf("ResultMatchFailed is not a liveness error")
+	}
+	if IsLivenessError(nil) {
+		t.Errorf("nil error must not be a liveness error")
+	}
+	if IsLivenessError(errors.New("io: some unrelated failure")) {
+		t.Errorf("plain errors must not be a liveness error")
+	}
+}
+
 func TestClient_Recognize_ShortPayload(t *testing.T) {
 	// Payload omits the faceID bytes.
 	rt := newReplyTransport(makeReply(CmdRecognize, ResultSuccess, []byte{0x01}))

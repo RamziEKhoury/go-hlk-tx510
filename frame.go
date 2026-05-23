@@ -26,7 +26,7 @@ var (
 
 type Reply struct {
 	AckedID CmdID
-	Result ResultCode
+	Result  ResultCode
 	Payload []byte
 }
 
@@ -45,9 +45,7 @@ func (e *ResultError) Error() string {
 	return fmt.Sprintf("tx510: %s (0x%02x)", e.Code.String(), byte(e.Code))
 }
 
-
-// frame functions: build , parse, read.
-func BuildFrame (msgID CmdID, data []byte) []byte{
+func BuildFrame(msgID CmdID, data []byte) []byte {
 	size := uint32(len(data))
 	buf := make([]byte, 0, headerLen+len(data)+parityLen)
 	buf = append(buf, magic0, magic1, byte(msgID))
@@ -58,18 +56,18 @@ func BuildFrame (msgID CmdID, data []byte) []byte{
 	for _, b := range buf[2:] {
 		parity += b
 	}
-	return append(buf,parity)
+	return append(buf, parity)
 }
 
-func ParseFrame(raw []byte) (*Reply, error){
-	if len(raw) < headerLen+parityLen{
+func ParseFrame(raw []byte) (*Reply, error) {
+	if len(raw) < headerLen+parityLen {
 		return nil, ErrFrameTooShort
 	}
 	if raw[0] != magic0 || raw[1] != magic1 {
 		return nil, ErrBadHeader
 	}
 	size := binary.BigEndian.Uint32(raw[3:7])
-	if size > MaxFrameSize{
+	if size > MaxFrameSize {
 		return nil, ErrFrameTooLarge
 	}
 	end := headerLen + int(size)
@@ -103,14 +101,36 @@ func ParseFrame(raw []byte) (*Reply, error){
 	}, nil
 }
 
+// maxResyncSkip bounds the byte-by-byte hunt for the magic word so a garbled link can't spin forever.
+const maxResyncSkip = MaxFrameSize
+
 func ReadFrame(r io.Reader) (*Reply, error) {
 	hdr := make([]byte, headerLen)
-	if _, err := io.ReadFull(r, hdr); err != nil {
+
+	// Slide a 2-byte window until we see magic0 followed by magic1; everything before is discarded.
+	one := make([]byte, 1)
+	var prev byte
+	skipped := 0
+	for {
+		if _, err := io.ReadFull(r, one); err != nil {
+			return nil, fmt.Errorf("tx510: read header: %w", err)
+		}
+		if prev == magic0 && one[0] == magic1 {
+			break
+		}
+		prev = one[0]
+		skipped++
+		if skipped > maxResyncSkip {
+			return nil, ErrBadHeader
+		}
+	}
+
+	hdr[0] = magic0
+	hdr[1] = magic1
+	if _, err := io.ReadFull(r, hdr[2:]); err != nil {
 		return nil, fmt.Errorf("tx510: read header: %w", err)
 	}
-	if hdr[0] != magic0 || hdr[1] != magic1 {
-		return nil, ErrBadHeader
-	}
+
 	size := binary.BigEndian.Uint32(hdr[3:7])
 	if size > MaxFrameSize {
 		return nil, ErrFrameTooLarge

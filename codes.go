@@ -1,6 +1,7 @@
 package tx510
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -51,13 +52,13 @@ func (b BaudRate) Int() int {
 type ResultCode byte
 
 const (
-	ResultSuccess				ResultCode = 0x00
-	ResultNoFace				ResultCode = 0x01
-	ResultPoseAngleTooLarge		ResultCode = 0x03
-	ResultLiveness2DFailed		ResultCode = 0x06
-	ResultLiveness3DFailed		ResultCode = 0x07
-	ResultMatchFailed			ResultCode = 0x08
-	ResultDuplicateFace 		ResultCode = 0x09
+	ResultSuccess           ResultCode = 0x00
+	ResultNoFace            ResultCode = 0x01
+	ResultPoseAngleTooLarge ResultCode = 0x03
+	ResultLiveness2DFailed  ResultCode = 0x06
+	ResultLiveness3DFailed  ResultCode = 0x07
+	ResultMatchFailed       ResultCode = 0x08
+	ResultDuplicateFace     ResultCode = 0x09
 )
 
 func (c CmdID) String() string {
@@ -95,23 +96,32 @@ func (c CmdID) String() string {
 
 func (r ResultCode) String() string {
 	switch r {
-		case ResultSuccess:
-			return "Success"
-		case ResultNoFace:
-			return "No face detected"
-		case ResultPoseAngleTooLarge:
-			return "Face too far"
-		case ResultLiveness2DFailed:
-			return "2D Liveness check failed"
-		case ResultLiveness3DFailed:
-			return "3D Liveness check failed"
-		case ResultMatchFailed:
-			return "Match failed"
-		case ResultDuplicateFace:
-			return "Face duplication"
-		default:
-			return fmt.Sprintf("unknown(0x%02x)", byte(r))
+	case ResultSuccess:
+		return "Success"
+	case ResultNoFace:
+		return "No face detected"
+	case ResultPoseAngleTooLarge:
+		return "Face too far"
+	case ResultLiveness2DFailed:
+		return "2D Liveness check failed"
+	case ResultLiveness3DFailed:
+		return "3D Liveness check failed"
+	case ResultMatchFailed:
+		return "Match failed"
+	case ResultDuplicateFace:
+		return "Face duplication"
+	default:
+		return fmt.Sprintf("unknown(0x%02x)", byte(r))
 	}
 }
 
-func (r ResultCode) IsSuccess() bool {return r == ResultSuccess}
+func (r ResultCode) IsSuccess() bool { return r == ResultSuccess }
+
+// IsLivenessError reports whether err is a ResultLiveness2DFailed or ResultLiveness3DFailed device reject.
+func IsLivenessError(err error) bool {
+	var rerr *ResultError
+	if !errors.As(err, &rerr) {
+		return false
+	}
+	return rerr.Code == ResultLiveness2DFailed || rerr.Code == ResultLiveness3DFailed
+}
