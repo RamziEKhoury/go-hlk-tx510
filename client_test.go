@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -599,5 +601,140 @@ func TestClient_SerializesConcurrentCalls(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Errorf("concurrent Version: %v", err)
+	}
+}
+
+func TestClient_DumpAll_WritesOneFilePerFace(t *testing.T) {
+	tplA := bytes.Repeat([]byte{0xA5}, TemplateSize)
+	tplB := bytes.Repeat([]byte{0x5A}, TemplateSize)
+	rt := newReplyTransport(
+		makeReply(CmdUserCount, ResultSuccess, []byte{0x00, 0x02, 0x00, 0x07, 0x00, 0x2A}),
+		makeReply(CmdReadEigenvalue, ResultSuccess, append([]byte{0x42, 0x0F, 0x00, 0x07}, tplA...)),
+		makeReply(CmdReadEigenvalue, ResultSuccess, append([]byte{0x42, 0x0F, 0x00, 0x2A}, tplB...)),
+	)
+	c := NewWithTransport(rt)
+
+	dir := t.TempDir()
+	ids, err := c.DumpAll(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("DumpAll: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != 7 || ids[1] != 42 {
+		t.Errorf("ids = %v, want [7 42]", ids)
+	}
+
+	gotA, err := os.ReadFile(filepath.Join(dir, "00007.tpl"))
+	if err != nil {
+		t.Fatalf("read dumped file A: %v", err)
+	}
+	if !bytes.Equal(gotA, tplA) {
+		t.Errorf("dumped file 00007.tpl does not match source template")
+	}
+	gotB, err := os.ReadFile(filepath.Join(dir, "00042.tpl"))
+	if err != nil {
+		t.Fatalf("read dumped file B: %v", err)
+	}
+	if !bytes.Equal(gotB, tplB) {
+		t.Errorf("dumped file 00042.tpl does not match source template")
+	}
+}
+
+func TestClient_DumpAll_EmptyGallery(t *testing.T) {
+	rt := newReplyTransport(makeReply(CmdUserCount, ResultSuccess, []byte{0x00, 0x00}))
+	c := NewWithTransport(rt)
+
+	dir := t.TempDir()
+	ids, err := c.DumpAll(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("DumpAll empty: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("ids = %v, want empty", ids)
+	}
+}
+
+func TestClient_RestoreAll_SkipsNonTplAndSortsFilenames(t *testing.T) {
+	dir := t.TempDir()
+	tplA := bytes.Repeat([]byte{0xA5}, TemplateSize)
+	tplB := bytes.Repeat([]byte{0x5A}, TemplateSize)
+	if err := os.WriteFile(filepath.Join(dir, "00002.tpl"), tplB, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "00001.tpl"), tplA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("ignore me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ackSeqs := []byte{0x01, 0x03, 0x07, 0x0F}
+	replies := make([][]byte, 0, 8)
+	for range 2 {
+		for _, seq := range ackSeqs {
+			replies = append(replies, makeReply(CmdWriteEigenvalue, ResultSuccess, []byte{0x42, seq, 0x00, 0x00}))
+		}
+	}
+	rt := newReplyTransport(replies...)
+	c := NewWithTransport(rt)
+
+	n, err := c.RestoreAll(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("restored count = %d, want 2", n)
+	}
+
+	// First 4 chunks must carry tplA's bytes (sorted filename 00001.tpl first), next 4 tplB.
+	raw := rt.writtenBytes()
+	var firstSlice, secondSlice []byte
+	for i := 0; i < 8; i++ {
+		if len(raw) < headerLen+parityLen {
+			t.Fatalf("ran out of bytes parsing chunk %d", i+1)
+		}
+		size := int(binary.BigEndian.Uint32(raw[3:7]))
+		frameLen := headerLen + size + parityLen
+		if len(raw) < frameLen {
+			t.Fatalf("chunk %d truncated", i+1)
+		}
+		data := raw[headerLen : headerLen+size]
+		raw = raw[frameLen:]
+		chunk := data[2:]
+		if i < 4 {
+			firstSlice = append(firstSlice, chunk...)
+		} else {
+			secondSlice = append(secondSlice, chunk...)
+		}
+	}
+	if !bytes.Equal(firstSlice, tplA) {
+		t.Errorf("first restored template != tplA (00001.tpl)")
+	}
+	if !bytes.Equal(secondSlice, tplB) {
+		t.Errorf("second restored template != tplB (00002.tpl)")
+	}
+}
+
+func TestClient_RestoreAll_MissingDir(t *testing.T) {
+	c := NewWithTransport(newReplyTransport())
+	_, err := c.RestoreAll(context.Background(), filepath.Join(t.TempDir(), "does-not-exist"))
+	if err == nil {
+		t.Fatalf("expected error for missing dir, got nil")
+	}
+}
+
+func TestClient_DumpAll_PropagatesReadTemplateError(t *testing.T) {
+	rt := newReplyTransport(
+		makeReply(CmdUserCount, ResultSuccess, []byte{0x00, 0x01, 0x00, 0x07}),
+		makeReply(CmdReadEigenvalue, ResultMatchFailed, nil),
+	)
+	c := NewWithTransport(rt)
+
+	_, err := c.DumpAll(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatalf("expected ReadTemplate failure to surface, got nil")
+	}
+	var rerr *ResultError
+	if !errors.As(err, &rerr) || rerr.Code != ResultMatchFailed {
+		t.Errorf("got %v, want wrapped *ResultError{ResultMatchFailed}", err)
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"time"
 )
 
-
 type Transport interface {
 	io.ReadWriter
 	SetReadDeadline(t time.Time) error

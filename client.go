@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -326,4 +329,52 @@ func (c *Client) WriteTemplate(ctx context.Context, template []byte) error {
 		}
 	}
 	return nil
+}
+
+// DumpAll writes every enrolled template to dir as `<faceID:05d>.tpl` and returns the IDs dumped. The directory is created if missing. Fails fast on the first error.
+func (c *Client) DumpAll(ctx context.Context, dir string) ([]uint16, error) {
+	ids, err := c.UserCount(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("tx510: DumpAll: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("tx510: DumpAll: %w", err)
+	}
+	for _, id := range ids {
+		tpl, err := c.ReadTemplate(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("tx510: DumpAll: read faceID %d: %w", id, err)
+		}
+		path := filepath.Join(dir, fmt.Sprintf("%05d.tpl", id))
+		if err := os.WriteFile(path, tpl, 0o644); err != nil {
+			return nil, fmt.Errorf("tx510: DumpAll: write %s: %w", path, err)
+		}
+	}
+	return ids, nil
+}
+
+// RestoreAll uploads every *.tpl file in dir (sorted by filename) via WriteTemplate and returns the count restored. The device assigns new faceIDs; filenames are host-side bookkeeping only.
+func (c *Client) RestoreAll(ctx context.Context, dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, fmt.Errorf("tx510: RestoreAll: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".tpl") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return 0, fmt.Errorf("tx510: RestoreAll: %w", err)
+		}
+		if err := c.WriteTemplate(ctx, data); err != nil {
+			return 0, fmt.Errorf("tx510: RestoreAll: %s: %w", name, err)
+		}
+	}
+	return len(names), nil
 }
